@@ -17,7 +17,6 @@ const serviceAccount = require("./firebase-admin-key.json");
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
-
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(uri, {
   serverApi: {
@@ -34,10 +33,13 @@ async function run() {
     const db = client.db("fastshiftDB"); // your DB name
     parcelCollection = db.collection("parcels");
     paymentsCollection = db.collection("payments");
+    trackingsCollection = db.collection("trackings");
     usersCollection = db.collection("users");
     ridersCollection = db.collection("riders");
 
     // custom middleware //
+
+    // verfy firebase token//
 
     const verifyFBToken = async (req, res, next) => {
       const authHeader = req.headers.authorization;
@@ -57,6 +59,34 @@ async function run() {
       } catch (error) {
         return res.status(403).send({ message: "Forbidden access" });
       }
+    };
+
+    // verify admin//
+
+    const verifyAdmin = async (req, res, next) => {
+      const email = req.decoded.email;
+      console.log(email);
+      const query = { email };
+      const user = await usersCollection.findOne(query);
+
+      if (!user || user.role !== "admin") {
+        return res.status(403).send({ message: "Forbidden access" });
+      }
+      next();
+    };
+
+    // verify Rider//
+
+    const verifyRider = async (req, res, next) => {
+      const email = req.decoded.email;
+      console.log(email);
+      const query = { email };
+      const user = await usersCollection.findOne(query);
+
+      if (!user || user.role !== "rider") {
+        return res.status(403).send({ message: "Forbidden access" });
+      }
+      next();
     };
 
     // Your POST API to add a parcel
@@ -101,6 +131,21 @@ async function run() {
       }
     });
 
+    app.get("/parcels/assignable", async (req, res) => {
+      try {
+        const query = {
+          payment_status: "paid",
+          delivery_status: "not_collected", // typo used in DB
+        };
+
+        const parcels = await parcelCollection.find(query).toArray();
+        res.send(parcels);
+      } catch (err) {
+        console.error("Error fetching assignable parcels:", err);
+        res.status(500).send({ message: "Internal Server Error" });
+      }
+    });
+
     // GET parcels by user email (latest first)
     app.get("/my-parcels", verifyFBToken, async (req, res) => {
       const userEmail = req.query.email;
@@ -114,7 +159,6 @@ async function run() {
           message: "❌ Please provide an email query parameter",
         });
       }
-
       try {
         const parcels = await parcelCollection
           .find({ created_by: userEmail })
@@ -133,6 +177,240 @@ async function run() {
           error: error.message,
         });
       }
+    });
+
+    // get matched rieder to sender service center
+
+    app.get("/riders/available", async (req, res) => {
+      const { district } = req.query;
+
+      try {
+        const riders = await ridersCollection
+          .find({ warehouse: district, status: "active" }) // ✅ Match with warehouse
+          .toArray();
+
+        res.send(riders);
+      } catch (err) {
+        console.error("Failed to fetch riders:", err);
+        res.status(500).send({ message: "Internal server error" });
+      }
+    });
+
+    // asgin rider
+    app.patch("/parcels/:id/assign", async (req, res) => {
+      const { id } = req.params;
+      const { riderId, riderName, riderEmail } = req.body;
+
+      try {
+        // 1. Update parcel
+        const parcelResult = await parcelCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              assigned_rider_id: riderId,
+              assigned_rider_email: riderEmail,
+              assigned_rider_name: riderName,
+              delivery_status: "rider_assigned", // ✅ Set to "in_transit"
+              assigned_at: new Date().toISOString(),
+            },
+          }
+        );
+        // 2. Update rider's work_status
+        const riderResult = await ridersCollection.updateOne(
+          { _id: new ObjectId(riderId) },
+          {
+            $set: {
+              work_status: "in_delivery", // ✅ Mark rider as busy
+            },
+          }
+        );
+
+        res.send({
+          success: true,
+          parcelModified: parcelResult.modifiedCount,
+          riderModified: riderResult.modifiedCount,
+        });
+      } catch (error) {
+        console.error("Assigning rider failed:", error);
+        res
+          .status(500)
+          .send({ success: false, message: "Assignment failed", error });
+      }
+    });
+
+    // GET: Get pending tasks for a specific rider
+    app.get(
+      "/parcels/rider-tasks",
+      verifyFBToken,
+      verifyRider,
+      async (req, res) => {
+        const riderEmail = req.query.email;
+
+        if (!riderEmail) {
+          return res.status(400).send({ message: "Rider email is required" });
+        }
+
+        try {
+          const tasks = await parcelCollection
+            .find({
+              assigned_rider_email: riderEmail,
+              delivery_status: { $in: ["rider_assigned", "in_transit"] },
+            })
+            .sort({ assigned_at: -1 }) // latest assigned tasks first
+            .toArray();
+
+          res.send(tasks);
+        } catch (error) {
+          console.error("Error fetching rider tasks:", error);
+          res.status(500).send({ message: "Failed to fetch rider tasks" });
+        }
+      }
+    );
+
+    // Mark as Picked Up (status => in_transit)
+    app.patch("/parcels/:id/picked-up", async (req, res) => {
+      const { id } = req.params;
+      const result = await parcelCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            delivery_status: "in_transit",
+            picked_at: new Date(), // ✅ Track when picked up
+          },
+        }
+      );
+      res.send(result);
+    });
+
+    // Mark as Delivered (status => delivered)
+    app.patch("/parcels/:id/delivered", async (req, res) => {
+      const { id } = req.params;
+      const result = await parcelCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            delivery_status: "delivered",
+            delivered_at: new Date(), // ✅ Track when delivered
+          },
+        }
+      );
+      res.send(result);
+    });
+
+    // GET: Get completed deliveries for a specific rider
+    app.get(
+      "/parcels/rider-completed",
+      verifyFBToken,
+      verifyRider,
+      async (req, res) => {
+        const riderEmail = req.query.email;
+
+        if (!riderEmail) {
+          return res.status(400).send({ message: "Rider email is required" });
+        }
+
+        try {
+          const completedParcels = await parcelCollection
+            .find({
+              assigned_rider_email: riderEmail,
+              delivery_status: {
+                $in: ["delivered", "service_center_delivered"],
+              },
+            })
+            .sort({ assigned_at: -1 }) // latest first
+            .toArray();
+
+          res.send(completedParcels);
+        } catch (error) {
+          console.error("Error fetching completed parcels:", error);
+          res
+            .status(500)
+            .send({ message: "Failed to fetch completed parcels" });
+        }
+      }
+    );
+
+    app.patch("/parcels/:id/cashout", async (req, res) => {
+      const id = req.params.id;
+
+      const result = await parcelCollection.updateOne(
+        { _id: new ObjectId(id) }, // find parcel by ID
+        {
+          $set: {
+            cashout_status: "cashed_out", // ✅ set new field
+            cashed_out_at: new Date(), // ✅ add timestamp
+          },
+        }
+      );
+
+      res.send(result);
+    });
+
+    //tracking related apis/////
+
+    // get trackings by id
+
+    app.get("/trackings/:trackingId", async (req, res) => {
+      const trackingId = req.params.trackingId;
+
+      try {
+        const updates = await trackingsCollection
+          .find({ tracking_id: trackingId }) // 👈 must match the saved field
+          .sort({ timestamp: 1 }) // oldest first
+          .toArray();
+
+        res.json(updates);
+      } catch (err) {
+        res.status(500).json({
+          message: "Failed to fetch tracking updates",
+          error: err.message,
+        });
+      }
+    });
+
+    // post trackings
+    app.post("/trackings", async (req, res) => {
+      const update = req.body;
+
+      update.timestamp = new Date(); // Add timestamp
+      if (!update.tracking_id || !update.status) {
+        return res
+          .status(400)
+          .json({ message: "tracking_id and status are required." });
+      }
+
+      try {
+        const result = await trackingsCollection.insertOne(update);
+        res.status(201).json(result);
+      } catch (err) {
+        res.status(500).json({
+          message: "Failed to save tracking update",
+          error: err.message,
+        });
+      }
+    });
+
+    app.get("/parcels/delivery/status-count", async (req, res) => {
+      const pipeline = [
+        {
+          $group: {
+            _id: "$delivery_status",
+            count: {
+              $sum: 1,
+            },
+          },
+        },
+        {
+          $project: {
+            status: "$_id",
+            count: 1,
+            _id: 0,
+          },
+        },
+      ];
+
+      const result = await parcelCollection.aggregate(pipeline).toArray();
+      res.send(result);
     });
 
     // GET single parcel by dynamic ID
@@ -269,7 +547,7 @@ async function run() {
 
     //get riders
 
-    app.get("/riders/pending", async (req, res) => {
+    app.get("/riders/pending", verifyFBToken, verifyAdmin, async (req, res) => {
       try {
         const pendingRiders = await ridersCollection
           .find({ status: "pending" })
@@ -282,7 +560,7 @@ async function run() {
     });
 
     // GET /riders/active
-    app.get("/riders/active", async (req, res) => {
+    app.get("/riders/active", verifyFBToken, verifyAdmin, async (req, res) => {
       try {
         const activeRiders = await ridersCollection
           .find({ status: "active" })
@@ -295,14 +573,131 @@ async function run() {
     });
 
     // PATCH /riders/status/:id
-    app.patch("/riders/status/:id", async (req, res) => {
-      const { id } = req.params;
-      const { status } = req.body;
-      const result = await ridersCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: { status } }
-      );
-      res.send(result);
+    app.patch(
+      "/riders/status/:id",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        const { id } = req.params;
+        const { status, email } = req.body;
+        const result = await ridersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status } }
+        );
+        // update user role for accepting rider
+        if (status === "active") {
+          const userQuery = { email };
+          const userUpdatedDoc = {
+            $set: {
+              role: "rider",
+            },
+          };
+          const rolResult = await usersCollection.updateOne(
+            userQuery,
+            userUpdatedDoc
+          );
+          console.log(rolResult.modifiedCount);
+        }
+
+        res.send(result);
+      }
+    );
+
+    // make user to admin //////////
+
+    // GET: Search users by email or name
+    app.get("/users/search", verifyFBToken, verifyAdmin, async (req, res) => {
+      const query = req.query.q;
+
+      if (!query) {
+        return res.status(400).send({ message: "Search query is required" });
+      }
+
+      try {
+        const users = await usersCollection
+          .find({
+            $or: [
+              { email: { $regex: query, $options: "i" } },
+              { name: { $regex: query, $options: "i" } },
+            ],
+          })
+          .limit(10)
+          .toArray();
+
+        res.send(users);
+      } catch (error) {
+        res
+          .status(500)
+          .send({ message: "Failed to search users", error: error.message });
+      }
+    });
+
+    // PATCH: Make user admin
+    app.patch(
+      "/users/make-admin/:id",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        const id = req.params.id;
+
+        try {
+          const result = await usersCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { role: "admin" } }
+          );
+          res.send(result);
+        } catch (err) {
+          res
+            .status(500)
+            .send({ message: "Failed to make admin", error: err.message });
+        }
+      }
+    );
+
+    // PATCH: Remove admin
+    app.patch(
+      "/users/remove-admin/:id",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        const id = req.params.id;
+
+        try {
+          const result = await usersCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { role: "user" } }
+          );
+          res.send(result);
+        } catch (err) {
+          res
+            .status(500)
+            .send({ message: "Failed to remove admin", error: err.message });
+        }
+      }
+    );
+
+    // role base get
+
+    app.get("/users/:email/role", async (req, res) => {
+      const email = req.params.email;
+
+      try {
+        const user = await usersCollection.findOne(
+          { email },
+          { projection: { role: 1, email: 1, created_at: 1 } }
+        );
+
+        if (!user) {
+          return res.status(404).send({ message: "User not found" });
+        }
+
+        res.send(user);
+      } catch (err) {
+        console.error("Error fetching user role:", err);
+        res
+          .status(500)
+          .send({ message: "Failed to get user role", error: err.message });
+      }
     });
 
     // parcel indend
